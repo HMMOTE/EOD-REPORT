@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>EOD Accomplishment Report</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--g:#4a7c39;--gl:#c6e0b4;--gbg:#EAF3DE;--b:#2E75B6;--bl:#dce9f7;--r:#C00000;--y:#ffffc0;--gray:#f5f5f5;--bdr:#d0d0d0;--tx:#222;--sub:#666}
@@ -233,8 +237,9 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--g);box-s
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
         <div class="ct" style="margin:0">📊 Generate Report</div>
-        <div style="display:flex;gap:8px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn bnb" onclick="exportExcel()">⬇ Export Excel</button>
+          <button class="btn" style="background:#e74c3c;color:#fff;border-color:#e74c3c" onclick="exportPDF()">⬇ Export PDF</button>
           <button class="btn" onclick="window.print()">🖨 Print</button>
         </div>
       </div>
@@ -256,13 +261,16 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--g);box-s
 
 <script>
 // =====================================================================
-// SHAREPOINT CONFIGURATION
-// Set this to your SharePoint site URL after uploading
-// Example: "https://yourcompany.sharepoint.com/sites/BillingCollection"
-// Leave as empty string "" to use localStorage only (offline mode)
-const SP_SITE = "https://valuecarehealth.sharepoint.com/sites/TPAOthers";
-// List name you create in SharePoint (instructions in README)
-const SP_LIST = "EODData";
+// FIREBASE CONFIGURATION
+// Replace with your Firebase project config
+const FB_CONFIG = {
+  apiKey: "AIzaSyDPhLnljByPE0I0TIICt4Rs_HM8UzsxAIU",
+  authDomain: "eod-report-1891c.firebaseapp.com",
+  projectId: "eod-report-1891c",
+  storageBucket: "eod-report-1891c.firebasestorage.app",
+  messagingSenderId: "247166194743",
+  appId: "1:247166194743:web:1eea007a41003917ad9bb2"
+};
 // =====================================================================
 
 const BILL_ROWS=[
@@ -270,7 +278,7 @@ const BILL_ROWS=[
   ['Billed Invoices',true,true,false],
   ['Released Invoices',true,true,false],
   ['Disputed Invoices/BCM',true,true,false],
-  ['Approved Invoices',true,false,false],
+  ['Approved Invoices',true,true,false],
   ['Others: Adhoc',false,false,true],
   ['Billing Recon',false,true,false],
   ['Others Task/Remarks',false,false,false,'remarks'],
@@ -319,99 +327,57 @@ function ensureDate(date){
   S.cm.forEach(m=>{if(!DB.collection[date][m])DB.collection[date][m]={}});
 }
 
-// ---- SharePoint REST API ----
-// Data is stored in a SharePoint List with columns: Title (key), DataJson (value)
-async function spGet(key){
-  if(!SP_SITE)return null;
+// ---- Firebase init ----
+let db=null,fbReady=false;
+function initFB(){
   try{
-    const url=`${SP_SITE}/_api/web/lists/getbytitle('${SP_LIST}')/items?$filter=Title eq '${encodeURIComponent(key)}'&$top=1&$select=Title,DataJson`;
-    const r=await Promise.race([
-      fetch(url,{headers:{'Accept':'application/json;odata=verbose','Content-Type':'application/json'}}),
-      new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),5000))
-    ]);
-    const d=await r.json();
-    const items=d?.d?.results;
-    if(items&&items.length>0){
-      const raw=items[0].DataJson||items[0].DataJson0||'null';
-      return JSON.parse(raw);
-    }
-    return null;
-  }catch(e){return null;}
-}
-
-async function spSet(key,value){
-  if(!SP_SITE){lsave();return;}
-  setSync('saving');
-  try{
-    // Get request digest (required for SharePoint writes)
-    const rdR=await fetch(`${SP_SITE}/_api/contextinfo`,{method:'POST',headers:{'Accept':'application/json;odata=verbose','Content-Type':'application/json'}});
-    const rdD=await rdR.json();
-    const digest=rdD?.d?.GetContextWebInformation?.FormDigestValue;
-
-    // Check if item exists
-    const url=`${SP_SITE}/_api/web/lists/getbytitle('${SP_LIST}')/items?$filter=Title eq '${encodeURIComponent(key)}'&$top=1`;
-    const chk=await fetch(url,{headers:{'Accept':'application/json;odata=verbose'}});
-    const chkD=await chk.json();
-    const existing=chkD?.d?.results;
-    const payload=JSON.stringify({__metadata:{type:'SP.Data.EODDataListItem'},Title:key,DataJson:JSON.stringify(value)});
-
-    if(existing&&existing.length>0){
-      // Update
-      const itemId=existing[0].Id;
-      await fetch(`${SP_SITE}/_api/web/lists/getbytitle('${SP_LIST}')/items(${itemId})`,{
-        method:'POST',
-        headers:{'Accept':'application/json;odata=verbose','Content-Type':'application/json;odata=verbose','X-RequestDigest':digest,'IF-MATCH':'*','X-HTTP-Method':'MERGE'},
-        body:payload
-      });
-    } else {
-      // Create
-      await fetch(`${SP_SITE}/_api/web/lists/getbytitle('${SP_LIST}')/items`,{
-        method:'POST',
-        headers:{'Accept':'application/json;odata=verbose','Content-Type':'application/json;odata=verbose','X-RequestDigest':digest},
-        body:payload
-      });
-    }
+    firebase.initializeApp(FB_CONFIG);
+    db=firebase.firestore();
+    fbReady=true;
     setSync('ok');
-    lsave(); // also keep local copy as backup
-  }catch(e){setSync('error');lsave();}
+  }catch(e){fbReady=false;setSync('local');}
 }
 
-async function loadFromSP(key){
-  const d=await spGet(key);
-  return d;
+// ---- Firebase save/load ----
+async function fbSet(path,data){
+  if(!fbReady){lsave();return;}
+  setSync('saving');
+  try{await db.doc(path).set(data,{merge:true});setSync('ok');lsave();}
+  catch(e){setSync('error');lsave();}
+}
+async function fbGet(path){
+  if(!fbReady)return null;
+  try{const s=await db.doc(path).get();return s.exists?s.data():null;}
+  catch(e){return null;}
 }
 
 // Load all data for a date
 async function loadDate(date){
   setSync('saving');
   ensureDate(date);
-  if(!SP_SITE){lload();setSync('local');return;}
+  if(!fbReady){lload();setSync('local');return;}
   try{
-    for(const m of S.bm){const d=await loadFromSP(`billing_${date}_${kk(m)}`);if(d)DB.billing[date][m]=d;}
-    for(const m of S.cm){const d=await loadFromSP(`collection_${date}_${kk(m)}`);if(d)DB.collection[date][m]=d;}
-    const n=await loadFromSP(`notes_${date}`);if(n)DB.notes[date]=n;
+    for(const m of S.bm){const d=await fbGet(`eod/billing_${date}_${kk(m)}`);if(d?.data)DB.billing[date][m]=d.data;}
+    for(const m of S.cm){const d=await fbGet(`eod/collection_${date}_${kk(m)}`);if(d?.data)DB.collection[date][m]=d.data;}
+    const n=await fbGet(`eod/notes_${date}`);if(n?.notes)DB.notes[date]=n.notes;
     setSync('ok');
   }catch(e){lload();setSync('local');}
 }
 
 async function loadConfig(){
   try{
-    if(!SP_SITE){lload();return;}
-    const d=await Promise.race([
-      loadFromSP('config'),
-      new Promise(r=>setTimeout(()=>r(null),3000)) // 3s timeout
-    ]);
+    if(!fbReady){lload();return;}
+    const d=await Promise.race([fbGet('eod/config'),new Promise(r=>setTimeout(()=>r(null),3000))]);
     if(d){S.unit=d.unit||S.unit;S.hc=d.hc||S.hc;S.bm=d.bm||S.bm;S.cm=d.cm||S.cm;S.bv=d.bv||S.bv;S.cv=d.cv||S.cv;}
     else lload();
   }catch(e){lload();}
 }
 
-async function saveConfig(){
-  await spSet('config',{unit:S.unit,hc:S.hc,bm:S.bm,cm:S.cm,bv:S.bv,cv:S.cv});
-}
+async function saveConfig(){await fbSet('eod/config',{unit:S.unit,hc:S.hc,bm:S.bm,cm:S.cm,bv:S.bv,cv:S.cv});}
+async function saveNotes(date){await fbSet(`eod/notes_${date}`,{date,notes:DB.notes[date],t:Date.now()});}
 
 // ---- Local storage fallback ----
-const LS='eod_sp_v1';
+const LS='eod_fb_v1';
 function lsave(){try{localStorage.setItem(LS,JSON.stringify({billing:DB.billing,collection:DB.collection,notes:DB.notes,config:{unit:S.unit,hc:S.hc,bm:S.bm,cm:S.cm,bv:S.bv,cv:S.cv}}));}catch(e){}}
 function lload(){
   try{const r=localStorage.getItem(LS);if(!r)return;const d=JSON.parse(r);
@@ -425,13 +391,13 @@ const saveQ={};
 function qSave(team,date,member,mdata){
   const key=`${team}_${date}_${kk(member)}`;
   clearTimeout(saveQ[key]);
-  saveQ[key]=setTimeout(()=>spSet(key,mdata),1000);
+  saveQ[key]=setTimeout(()=>fbSet(`eod/${key}`,{team,date,member,data:mdata,t:Date.now()}),900);
 }
 const mdQ={};
 function qSaveMD(team,date,name,mdata){
   const key=`${team}_${date}_${kk(name)}`;
   clearTimeout(mdQ[key]);
-  mdQ[key]=setTimeout(()=>spSet(key,mdata),1000);
+  mdQ[key]=setTimeout(()=>fbSet(`eod/${key}`,{team,date,member:name,data:mdata,t:Date.now()}),900);
 }
 
 // ---- Landing ----
@@ -592,7 +558,7 @@ async function saveTeamNotes(team){
   if(!DB.notes[date])DB.notes[date]={b:{},c:{}};
   const p=team==='billing'?'b':'c';
   DB.notes[date][p]={analysis:document.getElementById(p+'-analysis').value,redflag:document.getElementById(p+'-redflag').value,action:document.getElementById(p+'-action').value};
-  await spSet(`notes_${date}`,DB.notes[date]);
+  await saveNotes(date);
   toast('Notes saved');
 }
 
@@ -658,7 +624,7 @@ function saveMD(team,date,name,rowKey,val){
 }
 function flushMD(name,team,date){
   const store=team==='billing'?DB.billing:DB.collection;
-  spSet(`${team}_${date}_${kk(name)}`,store[date]?.[name]||{}).then(()=>toast('Saved'));
+  fbSet(`eod/${team}_${date}_${kk(name)}`,{team,date,member:name,data:store[date]?.[name]||{},t:Date.now()}).then(()=>toast('Saved'));
 }
 
 // ---- Report ----
@@ -774,7 +740,7 @@ function saveRN(date,t,f,val){
   if(!DB.notes[date])DB.notes[date]={b:{analysis:'',redflag:'',action:''},c:{analysis:'',redflag:'',action:''}};
   DB.notes[date][t][f]=val;
 }
-async function flushNotes(date){await spSet(`notes_${date}`,DB.notes[date]);toast('Notes saved');}
+async function flushNotes(date){await saveNotes(date);toast('Notes saved');}
 
 // ---- Excel export ----
 function exportExcel(){
@@ -806,11 +772,113 @@ function exportExcel(){
   toast('Excel exported');
 }
 
-function toast(msg){const t=document.getElementById('toast-msg');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
+function exportPDF(){
+  const date=S.reportDate||document.getElementById('rpt-date').value;
+  if(!date){toast('Select a date first');return;}
+  const bD=DB.billing[date]||{},cD=DB.collection[date]||{};
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
+  const pageW=doc.internal.pageSize.getWidth();
+
+  // Header
+  doc.setFontSize(13);doc.setFont('helvetica','bold');
+  doc.text('BILLING & COLLECTION DEPARTMENT',pageW/2,14,{align:'center'});
+  doc.setFontSize(10);doc.setTextColor(46,117,182);
+  doc.text('EOD ACCOMPLISHMENT REPORT',pageW/2,20,{align:'center'});
+  doc.setTextColor(0,0,0);doc.setFontSize(9);doc.setFont('helvetica','normal');
+  doc.text(`DATE: ${fmtDate(date)}`,14,27);
+  doc.text(`UNIT: ${S.unit}`,pageW/2,27,{align:'center'});
+  doc.setTextColor(192,0,0);
+  doc.text(`Head Count: ${S.hc}`,pageW-14,27,{align:'right'});
+  doc.setTextColor(0,0,0);
+
+  function makeTable(title,rows,members,data,vacants,isC,startY){
+    const hasA=rows.some(r=>r[1]),hasC=rows.some(r=>r[2]);
+    const cols=['#','Activity',...members.flatMap(m=>vacants.includes(m)?[m+' (V)']:[...(hasA?[m+'\nAmt']:[]),...(hasC?[m+'\nCnt']:[])]),'Total\nAmt','Total\nCnt'];
+    const body=[];
+    let num=1;
+    rows.forEach(([lb,hA,hC,adh,isRmk])=>{
+      if(isRmk==='remarks'){
+        const rmkRow=[num,lb,...members.flatMap(m=>{if(vacants.includes(m))return['—'];const v=data[m]?.[lb+'__remarks']||'';const sp=(hasA?1:0)+(hasC?1:0)||1;return sp===2?[v,'']:[v];}),'',''];
+        body.push(rmkRow);num++;return;
+      }
+      const aK=lb+'__amt',cK=lb+'__count',tK=lb+'__text';
+      const row=[num,lb,...members.flatMap(m=>{
+        if(vacants.includes(m))return['—'];
+        const av=hasA?(hA?(data[m]?.[aK]?fmtAmt(data[m][aK]):'—'):'—'):null;
+        const cv=hasC?(hC?(data[m]?.[cK]||'—'):'—'):null;
+        return[...(av!==null?[av]:[]),...(cv!==null?[cv]:[])];
+      }),hA?fmtAmt(members.reduce((s,m)=>vacants.includes(m)?s:s+(data[m]?.[aK]||0),0)):'—'
+        ,hC?members.reduce((s,m)=>vacants.includes(m)?s:s+(data[m]?.[cK]||0),0)||'—':'—'];
+      body.push(row);
+      if(adh){
+        const anyTxt=members.some(m=>!vacants.includes(m)&&data[m]?.[tK]);
+        if(anyTxt){
+          const ar=['','↳ Adhoc',...members.flatMap(m=>{if(vacants.includes(m))return[''];const t=data[m]?.[tK]||'';const c=(hasA?1:0)+(hasC?1:0);return c===2?[t,'']:[t];}),'',''];
+          body.push(ar);
+        }
+      }
+      num++;
+    });
+    const hdrColor=isC?[46,117,182]:[74,124,57];
+    doc.autoTable({
+      head:[cols],body,startY,
+      styles:{fontSize:7,cellPadding:1.5},
+      headStyles:{fillColor:hdrColor,textColor:255,fontStyle:'bold',fontSize:7},
+      columnStyles:{0:{cellWidth:6},1:{cellWidth:38}},
+      didDrawPage:()=>{},
+      margin:{left:14,right:14},
+      theme:'grid',
+      didParseCell:(d)=>{
+        if(d.row.index===body.length-1&&d.section==='body'){d.cell.styles.fontStyle='bold';d.cell.styles.fillColor=[198,224,180];}
+        if(d.section==='head'){d.cell.styles.halign='center';}
+        if(d.row.raw&&d.row.raw[1]&&String(d.row.raw[1]).includes('↳')){d.cell.styles.fontStyle='italic';d.cell.styles.textColor=[120,120,120];}
+      }
+    });
+    // Title label above table
+    const titleY=startY-3;
+    doc.setFillColor(...hdrColor);
+    doc.rect(14,titleY-4,pageW-28,5,'F');
+    doc.setTextColor(255,255,255);doc.setFontSize(8);doc.setFont('helvetica','bold');
+    doc.text(title,pageW/2,titleY,{align:'center'});
+    doc.setTextColor(0,0,0);doc.setFont('helvetica','normal');
+    return doc.lastAutoTable.finalY;
+  }
+
+  const y1=makeTable('BILLING TEAM',BILL_ROWS,S.bm,bD,S.bv,false,36);
+
+  // Notes billing
+  const bN=DB.notes[date]?.b||{};
+  let ny=y1+6;
+  if(bN.analysis||bN.redflag||bN.action){
+    doc.setFontSize(7);
+    if(bN.analysis){doc.setFont('helvetica','bold');doc.text('Accomplishment Analysis:',14,ny);doc.setFont('helvetica','normal');doc.text(bN.analysis,60,ny);ny+=5;}
+    if(bN.redflag){doc.setFont('helvetica','bold');doc.setTextColor(192,0,0);doc.text('Red Flag:',14,ny);doc.setFont('helvetica','normal');doc.text(bN.redflag,40,ny);doc.setTextColor(0,0,0);ny+=5;}
+    if(bN.action){doc.setFont('helvetica','bold');doc.text('Actionable Items:',14,ny);doc.setFont('helvetica','normal');doc.text(bN.action,55,ny);ny+=5;}
+  }
+
+  const y2=makeTable('COLLECTION TEAM',COLL_ROWS,S.cm,cD,S.cv,true,ny+8);
+
+  // Notes collection
+  const cN=DB.notes[date]?.c||{};
+  let cy=y2+6;
+  if(cN.analysis||cN.redflag||cN.action){
+    doc.setFontSize(7);
+    if(cN.analysis){doc.setFont('helvetica','bold');doc.text('Accomplishment Analysis:',14,cy);doc.setFont('helvetica','normal');doc.text(cN.analysis,60,cy);cy+=5;}
+    if(cN.redflag){doc.setFont('helvetica','bold');doc.setTextColor(192,0,0);doc.text('Red Flag:',14,cy);doc.setFont('helvetica','normal');doc.text(cN.redflag,40,cy);doc.setTextColor(0,0,0);cy+=5;}
+    if(cN.action){doc.setFont('helvetica','bold');doc.text('Actionable Items:',14,cy);doc.setFont('helvetica','normal');doc.text(cN.action,55,cy);}
+  }
+
+  doc.save(`EOD_Report_${date}.pdf`);
+  toast('PDF exported');
+}
+
+const t=document.getElementById('toast-msg');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
 
 // ---- Init ----
 document.getElementById('cfg-date').value=today();
 lload();
+initFB();
 // Build landing immediately with defaults so names show right away
 buildLanding();
 document.getElementById('cfg-unit').value=S.unit;
